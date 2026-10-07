@@ -237,7 +237,9 @@ Remplacement direct des APIs OpenAI et Anthropic. Supporte les statistiques d'us
 | `POST /v1/messages` | API Messages Anthropic |
 | `POST /v1/embeddings` | Embeddings texte |
 | `POST /v1/rerank` | Reranking de documents |
+| `POST /v1/systemone` | Décisions typées avec les modèles de décision (TypeSafe System One) |
 | `GET /v1/models` | Lister les modèles disponibles |
+| `POST /tokenize`, `POST /detokenize` | API de tokenisation compatible vLLM (aussi sous `/v1`) |
 
 ### Appel d'outils et sorties structurées
 
@@ -278,6 +280,7 @@ Les modèles sont auto-détectés par type. Vous pouvez aussi télécharger des 
 | OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
 | Embedding | BERT, BGE-M3, ModernBERT |
 | Reranker | ModernBERT, XLM-RoBERTa |
+| Decision | Clef, Clef-Flash, OpenJev |
 
 ## Configuration CLI
 
@@ -320,7 +323,8 @@ Serveur FastAPI (API OpenAI / Anthropic)
     │   ├── BatchedEngine (LLMs, batching continu)
     │   ├── VLMEngine (modèles vision-langage)
     │   ├── EmbeddingEngine
-    │   └── RerankerEngine
+    │   ├── RerankerEngine
+    │   └── DecisionEngine
     │
     ├── ProcessMemoryEnforcer (limite mémoire totale, vérifications TTL)
     │

@@ -237,7 +237,9 @@ brew services info omlx     # 查看状态
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/embeddings` | 文本嵌入 |
 | `POST /v1/rerank` | 文档重排序 |
+| `POST /v1/systemone` | 决策模型的类型化判断 (TypeSafe System One) |
 | `GET /v1/models` | 列出可用模型 |
+| `POST /tokenize`, `POST /detokenize` | 兼容 vLLM 的分词器 API（也可通过 `/v1` 访问） |
 
 ### 工具调用与结构化输出
 
@@ -280,6 +282,7 @@ brew services info omlx     # 查看状态
 | OCR | DeepSeek-OCR、DOTS-OCR、GLM-OCR |
 | 嵌入 | BERT、BGE-M3、ModernBERT |
 | 重排序 | ModernBERT、XLM-RoBERTa |
+| 决策 | Clef、Clef-Flash、OpenJev |
 
 ## CLI 配置
 
@@ -322,7 +325,8 @@ FastAPI Server (OpenAI / Anthropic API)
     │   ├── BatchedEngine (LLM，连续批处理)
     │   ├── VLMEngine (视觉语言模型)
     │   ├── EmbeddingEngine
-    │   └── RerankerEngine
+    │   ├── RerankerEngine
+    │   └── DecisionEngine
     │
     ├── ProcessMemoryEnforcer (总内存限制、TTL 检查)
     │
@@ -391,5 +395,5 @@ apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 
 ---
 
-> 💡 **文档维护说明**：本中文文档由社区志愿者（@JasonYeYuhe）翻译维护，最后同步更新于 2026年10月4日。如发现内容与官方英文原版存在差异或新特性滞后，欢迎提交 PR 共同完善！
+> 💡 **文档维护说明**：本中文文档由社区志愿者（@JasonYeYuhe）翻译维护，最后同步更新于 2026年10月7日。如发现内容与官方英文原版存在差异或新特性滞后，欢迎提交 PR 共同完善！
 
