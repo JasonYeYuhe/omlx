@@ -64,19 +64,10 @@ using ProfileCategory =
     std::array<std::atomic<uint64_t>, kProfileMetricCount>;
 ProfileCategory g_ane_profile[2]{};
 std::atomic<uint64_t> g_previous_ane_done_ns{0};
-std::atomic<int> g_ane_profile_override{-1};
+std::atomic<bool> g_ane_profile_enabled{false};
 
 bool ane_profile_enabled() {
-  const int override =
-      g_ane_profile_override.load(std::memory_order_relaxed);
-  if (override >= 0) {
-    return override != 0;
-  }
-  static const bool enabled = [] {
-    const char *value = std::getenv("OMLX_ANE_PROFILE");
-    return value && std::strcmp(value, "1") == 0;
-  }();
-  return enabled;
+  return g_ane_profile_enabled.load(std::memory_order_relaxed);
 }
 
 uint64_t profile_now_ns() {
@@ -747,24 +738,8 @@ public:
 // and waited on before the evaluation thread is spawned) and a healthy
 // evaluation in milliseconds-to-seconds (first-eval JIT), but a wedged ANE
 // driver never signals at all (#2974) — without a bound, one lost signal
-// spins a core forever and hangs the server. OMLX_ANE_WAIT_TIMEOUT_S
-// overrides the 30s default; 0 restores the old unbounded behavior.
-static std::chrono::seconds ane_wait_timeout() {
-  static const std::chrono::seconds timeout = [] {
-    if (const char *raw = std::getenv("OMLX_ANE_WAIT_TIMEOUT_S")) {
-      char *end = nullptr;
-      const long parsed = std::strtol(raw, &end, 10);
-      if (end != raw) {
-        if (parsed <= 0) {
-          return std::chrono::seconds(std::chrono::hours(24 * 365));
-        }
-        return std::chrono::seconds(parsed);
-      }
-    }
-    return std::chrono::seconds(30);
-  }();
-  return timeout;
-}
+// spins a core forever and hangs the server.
+constexpr std::chrono::seconds kAneWaitTimeout{30};
 
 class AneLinearModel::Impl {
 public:
@@ -1085,8 +1060,7 @@ public:
       // grace period, then latch — a counter stuck past the timeout is the
       // wedged-driver state and must not stay indistinguishable from a race.
       const bool settled = completion_cv_.wait_for(
-          lock, ane_wait_timeout(),
-          [this] { return completed_ >= submitted_; });
+          lock, kAneWaitTimeout, [this] { return completed_ >= submitted_; });
       if (!settled) {
         if (completion_error_.empty()) {
           completion_error_ = "a prior ANE evaluation never completed";
@@ -1104,12 +1078,16 @@ public:
     ++submitted_;
     id<MTLCommandBuffer> buffer =
         (__bridge id<MTLCommandBuffer>)(static_cast<void *>(command_buffer));
-    [buffer encodeSignalEvent:event_ value:ready];
+    if (command_buffer) {
+      [buffer encodeSignalEvent:event_ value:ready];
+    } else {
+      [event_ setSignaledValue:ready];
+    }
     return {ready, done};
   }
 
   void evaluate_and_signal(AneLinearModel::Ticket ticket) {
-    const auto deadline = std::chrono::steady_clock::now() + ane_wait_timeout();
+    const auto deadline = std::chrono::steady_clock::now() + kAneWaitTimeout;
     while ([event_ signaledValue] < ticket.ready) {
       if (std::chrono::steady_clock::now() >= deadline) {
         {
@@ -1179,7 +1157,7 @@ public:
   void wait(AneLinearModel::Ticket) {
     std::unique_lock<std::mutex> lock(state_mutex_);
     const bool finished = completion_cv_.wait_for(
-        lock, ane_wait_timeout(), [this] { return completed_ >= submitted_; });
+        lock, kAneWaitTimeout, [this] { return completed_ >= submitted_; });
     if (!finished) {
       // The evaluation thread is parked inside the private ANE framework and
       // cannot be unblocked from here; latch the error so begin() refuses
@@ -1201,8 +1179,7 @@ public:
     {
       std::unique_lock<std::mutex> lock(state_mutex_);
       const bool idle = completion_cv_.wait_for(
-          lock, ane_wait_timeout(),
-          [this] { return submitted_ == completed_; });
+          lock, kAneWaitTimeout, [this] { return submitted_ == completed_; });
       if (!idle) {
         throw std::runtime_error(
             "Prior ANE evaluation never completed; refusing to warm this "
@@ -1400,7 +1377,7 @@ bool qwen35_ane_available() {
 }
 
 void qwen35_ane_profile_set_enabled(bool enabled) {
-  g_ane_profile_override.store(enabled ? 1 : 0, std::memory_order_relaxed);
+  g_ane_profile_enabled.store(enabled, std::memory_order_relaxed);
 }
 
 void qwen35_ane_profile_reset() {
@@ -1598,6 +1575,131 @@ qwen35_ane_compile_fp16_linear(const array &weight, int sequence_length) {
   return std::shared_ptr<AneLinearModel>(new AneLinearModel(std::move(impl)));
 }
 
+class K2AnePlanarPrimitive : public Primitive {
+public:
+  K2AnePlanarPrimitive(Stream stream, std::shared_ptr<AneLinearModel> model)
+      : Primitive(stream), model_(std::move(model)) {}
+
+  void eval_cpu(const std::vector<array> &, std::vector<array> &) override {
+    throw std::runtime_error("K2 ANE planar transfer has no CPU implementation");
+  }
+
+  void eval_gpu(const std::vector<array> &inputs, std::vector<array> &outputs) override {
+    auto &device = metal::device(stream().device);
+    auto &encoder = metal::get_command_encoder(stream());
+    auto library = device.get_library("omlx_qwen35_prefill_kernels", binary_dir());
+    auto copy = device.get_kernel("k2_ane_copy_planar", library);
+    const auto &x = inputs[0];
+    auto &output = outputs[0];
+    output.set_data(allocator::malloc(output.nbytes()));
+    const bool profiling = ane_profile_enabled();
+    const uint64_t start = profiling ? profile_now_ns() : 0;
+    if (profiling) profile_add(0, kOperations, 1);
+
+    encoder.set_compute_pipeline_state(copy);
+    encoder.set_input_array(x, 0);
+    encoder.set_buffer(model_->input_buffer(), 1);
+    encoder.dispatch_threads(MTL::Size(x.size(), 1, 1), MTL::Size(256, 1, 1));
+    encoder.end_encoding();
+    auto *producer = encoder.get_command_buffer();
+    producer->retain();
+    AneLinearModel::Ticket ticket{};
+    try {
+      ticket = model_->begin(producer);
+    } catch (...) {
+      producer->release();
+      throw;
+    }
+    AneDispatchGuard guard(producer, model_, ticket);
+    encoder.commit();
+    producer->waitUntilCompleted();
+    if (pack_buffer_failed(producer)) {
+      throw std::runtime_error(pack_buffer_error(producer));
+    }
+    producer->release();
+    guard.producer_released();
+    const uint64_t ready = profiling ? profile_now_ns() : 0;
+    std::thread([model = model_, ticket] { model->execute(ticket); }).detach();
+    guard.disarm();
+    model_->wait(ticket);
+    if (profiling) {
+      profile_add(0, kPackNs, ready - start);
+      profile_add(0, kAne0EvalNs, profile_now_ns() - ready);
+    }
+
+    encoder.set_compute_pipeline_state(copy);
+    encoder.set_buffer(model_->output_buffer(), 0);
+    encoder.set_output_array(output, 1);
+    encoder.dispatch_threads(MTL::Size(output.size(), 1, 1), MTL::Size(256, 1, 1));
+    // MLX detaches the primitive after scheduling; its command buffers do not
+    // retain resources. Keep the ANE IOSurfaces alive through the output copy.
+    encoder.get_command_buffer()->addCompletedHandler(
+        MTL::HandlerFunction([model = model_](MTL::CommandBuffer *) {}));
+    // As in Qwen, force MLX onto its post-commit path after the input commit.
+    auto commit_guard = device.get_kernel("qwen35_ane_commit_guard", library);
+    encoder.set_compute_pipeline_state(commit_guard);
+    while (!encoder.needs_commit()) {
+      encoder.dispatch_threads(MTL::Size(1, 1, 1), MTL::Size(1, 1, 1));
+    }
+  }
+  DEFINE_NAME(K2AnePlanarPrimitive);
+  bool is_equivalent(const Primitive &other) const override {
+    return model_ == static_cast<const K2AnePlanarPrimitive &>(other).model_;
+  }
+private:
+  std::shared_ptr<AneLinearModel> model_;
+};
+
+array ane_planar(const array &x, const std::shared_ptr<AneLinearModel> &model) {
+  if (!model || x.ndim() != 2 || x.dtype() != float16 || !row_contiguous(x) ||
+      x.shape(0) != model->input_dim() || x.shape(1) != model->sequence_length() ||
+      model->sequence_length() % 32) {
+    throw std::invalid_argument("ANE planar I/O requires contiguous FP16 [channels, tile] input");
+  }
+  if (model->has_error()) throw std::runtime_error("ANE program has a prior execution failure");
+  // A host wait inside eval_gpu cannot advance lazy producers on other streams.
+  // Serving already evaluates packing before submitting the GPU MLP suffix.
+  array input = x;
+  input.eval();
+  // Keep transfers independent of the already-submitted GPU MLP suffix.
+  static const auto transfer_stream = new_thread_unsafe_stream(Device::gpu);
+  return array({model->output_dim(), model->sequence_length()}, float16,
+      std::make_shared<K2AnePlanarPrimitive>(transfer_stream, model), {input});
+}
+
+std::shared_ptr<AneLinearModel> ane_compile_program(
+    const std::string &mil_source, const array &weight_blob,
+    int input_dim, int output_dim, int sequence_length) {
+  if (!qwen35_ane_available()) throw std::runtime_error("Private ANE runtime is unavailable.");
+  if (mil_source.empty() || weight_blob.dtype() != mlx::core::uint8 || weight_blob.ndim() != 1 ||
+      !row_contiguous(weight_blob) || weight_blob.size() < 128 ||
+      input_dim <= 0 || output_dim <= 0 || sequence_length < 2 ||
+      sequence_length % 32) {
+    throw std::invalid_argument("Invalid generated ANE program.");
+  }
+  @autoreleasepool {
+    NSData *mil = [NSData dataWithBytes:mil_source.data() length:mil_source.size()];
+    NSData *blob = [NSData dataWithBytes:weight_blob.data<uint8_t>() length:weight_blob.size()];
+    NSDictionary *weights = @{@"@model_path/weights/weight.bin" : @{@"offset" : @0, @"data" : blob}};
+    Class descriptors = NSClassFromString(@"_ANEInMemoryModelDescriptor");
+    Class models = NSClassFromString(@"_ANEInMemoryModel");
+    id descriptor = ((id (*)(Class, SEL, id, id, id))objc_msgSend)(
+        descriptors, @selector(modelWithMILText:weights:optionsPlist:), mil, weights, nil);
+    id model = ((id (*)(Class, SEL, id))objc_msgSend)(
+        models, @selector(inMemoryModelWithDescriptor:), descriptor);
+    if (!model) throw std::runtime_error("Generated ANE program creation failed.");
+    id identifier = ((id (*)(id, SEL))objc_msgSend)(model, @selector(hexStringIdentifier));
+    NSDictionary *options = ane_execution_options(0);
+    AneLoadResult loaded = load_or_compile_ane_model(
+        model, identifier, 0, options, mil, @{@"weight.bin" : blob},
+        @"K2 ANE program", @"K2 ANE program");
+    auto program = std::make_shared<SharedAneProgram>(model, loaded, options);
+    auto impl = std::make_unique<AneLinearModel::Impl>(
+        program, input_dim, output_dim, sequence_length, 0);
+    return std::shared_ptr<AneLinearModel>(new AneLinearModel(std::move(impl)));
+  }
+}
+
 std::shared_ptr<AneLinearModel> qwen35_ane_compile_swiglu_down(
     const array &gate_weight, const array &up_weight, const array &down_weight,
     int sequence_length, int ane_instance) {
@@ -1782,12 +1884,6 @@ namespace {
 std::atomic<bool> g_hybrid_nax_runtime_ok{true};
 
 bool hybrid_nax_enabled() {
-  const char *override = std::getenv("OMLX_QWEN35_QMM_NAX");
-  if (override && (std::strcmp(override, "0") == 0 ||
-                   std::strcmp(override, "false") == 0 ||
-                   std::strcmp(override, "off") == 0)) {
-    return false;
-  }
   return g_hybrid_nax_runtime_ok.load(std::memory_order_relaxed) &&
          is_nax_available() && nax_qmm_kernels_built() &&
          nax_qmm_runtime_active();
@@ -1932,26 +2028,13 @@ private:
 void cpu_fp16_matmul(const array &input, const array &weight, array &output,
                      int M, int N, int K, int cpu_threads,
                      bool shared_resource) {
-  const char *manual_shards_value =
-      std::getenv("OMLX_QWEN35_CPU_MANUAL_SHARDS");
   const int requested_threads =
       shared_resource && cpu_threads == 0 ? 8 : std::max(cpu_threads, 0);
-  const int manual_shards =
-      shared_resource
-          ? requested_threads
-          : (manual_shards_value
-                 ? (std::strcmp(manual_shards_value, "threads") == 0
-                        ? requested_threads
-                        : std::max(std::atoi(manual_shards_value), 0))
-                 : 0);
-  const char *manual_axis_value = std::getenv("OMLX_QWEN35_CPU_MANUAL_AXIS");
-  const bool shard_columns =
-      manual_axis_value && std::strcmp(manual_axis_value, "columns") == 0;
-  const bool use_shared_resource = shared_resource && !shard_columns &&
-                                   cpu_shared_resource_policy_available();
-  const int shard_extent = shard_columns ? N : M;
-  if (manual_shards > 1 && shard_extent > 1) {
-    const int shards = std::min(manual_shards, shard_extent);
+  const int manual_shards = shared_resource ? requested_threads : 0;
+  const bool use_shared_resource =
+      shared_resource && cpu_shared_resource_policy_available();
+  if (manual_shards > 1 && M > 1) {
+    const int shards = std::min(manual_shards, M);
     auto failure = std::make_shared<std::atomic<int>>(0);
     auto *input_data = const_cast<_Float16 *>(input.data<_Float16>());
     auto *weight_data = const_cast<_Float16 *>(weight.data<_Float16>());
@@ -1966,35 +2049,23 @@ void cpu_fp16_matmul(const array &input, const array &weight, array &output,
                 ? static_cast<int>((static_cast<int64_t>(row_blocks) * index) /
                                    shards) *
                       64
-                : static_cast<int>(
-                      (static_cast<int64_t>(shard_extent) * index) / shards);
+                : static_cast<int>((static_cast<int64_t>(M) * index) / shards);
         const int end =
             align_rows ? static_cast<int>(
                              (static_cast<int64_t>(row_blocks) * (index + 1)) /
                              shards) *
                              64
-                       : static_cast<int>((static_cast<int64_t>(shard_extent) *
-                                           (index + 1)) /
-                                          shards);
-        const int row_begin = shard_columns ? 0 : begin;
-        const int row_end = shard_columns ? M : end;
-        const int column_begin = shard_columns ? begin : 0;
-        const int column_end = shard_columns ? end : N;
-        const int rows = row_end - row_begin;
-        const int columns = column_end - column_begin;
+                       : static_cast<int>(
+                             (static_cast<int64_t>(M) * (index + 1)) / shards);
+        const int rows = end - begin;
         auto input_desc = cpu_matrix_descriptor(
-            input_data + static_cast<size_t>(row_begin) * K, rows, K,
+            input_data + static_cast<size_t>(begin) * K, rows, K,
             BNNSDataTypeFloat16);
-        auto weight_desc = cpu_matrix_descriptor(
-            weight_data + static_cast<size_t>(column_begin) * K, columns, K,
-            BNNSDataTypeFloat16);
+        auto weight_desc =
+            cpu_matrix_descriptor(weight_data, N, K, BNNSDataTypeFloat16);
         auto output_desc = cpu_matrix_descriptor(
-            output_data + static_cast<size_t>(row_begin) * N + column_begin,
-            rows, columns, BNNSDataTypeFloat16);
-        if (shard_columns) {
-          output_desc.stride[0] = 1;
-          output_desc.stride[1] = static_cast<size_t>(N);
-        }
+            output_data + static_cast<size_t>(begin) * N, rows, N,
+            BNNSDataTypeFloat16);
         BNNSFilterParameters filter_params{};
         filter_params.n_threads = 1;
         const ssize_t workspace_size =
@@ -2526,6 +2597,27 @@ public:
     }
     encoder.dispatch_threads(MTL::Size(output_n, M, 1),
                              MTL::Size(16, 16, 1));
+    // The merge encoder reads this program's single output IOSurface. MLX
+    // commits this command buffer lazily, so without draining it here the
+    // next dispatch to the same program (the next 2K tile of one chunk on
+    // hosts with 4K prefill chunks) can begin its ANE evaluation and overwrite
+    // the surface before the merge kernel has executed. begin() only orders
+    // against the previous evaluation, not the previous merge. Commit and
+    // wait: the ANE and qmm branches were already joined on the host above,
+    // so the only added latency is the merge kernel itself.
+    {
+      encoder.end_encoding();
+      auto *merge_buffer = encoder.get_command_buffer();
+      merge_buffer->retain();
+      encoder.commit();
+      merge_buffer->waitUntilCompleted();
+      if (merge_buffer->status() == MTL::CommandBufferStatusError) {
+        merge_buffer->release();
+        throw std::runtime_error("ANE hybrid merge command buffer failed");
+      }
+      merge_buffer->release();
+    }
+
 
     // This primitive deliberately commits intermediate command buffers. MLX's
     // evaluator retains the original buffer and only switches to its safe
@@ -2850,6 +2942,27 @@ public:
     }
     encoder.dispatch_threads(MTL::Size(output_n, M, 1),
                              MTL::Size(16, 16, 1));
+    // The merge encoder reads this program's single output IOSurface. MLX
+    // commits this command buffer lazily, so without draining it here the
+    // next dispatch to the same program (the next 2K tile of one chunk on
+    // hosts with 4K prefill chunks) can begin its ANE evaluation and overwrite
+    // the surface before the merge kernel has executed. begin() only orders
+    // against the previous evaluation, not the previous merge. Commit and
+    // wait: the ANE and qmm branches were already joined on the host above,
+    // so the only added latency is the merge kernel itself.
+    {
+      encoder.end_encoding();
+      auto *merge_buffer = encoder.get_command_buffer();
+      merge_buffer->retain();
+      encoder.commit();
+      merge_buffer->waitUntilCompleted();
+      if (merge_buffer->status() == MTL::CommandBufferStatusError) {
+        merge_buffer->release();
+        throw std::runtime_error("ANE hybrid merge command buffer failed");
+      }
+      merge_buffer->release();
+    }
+
 
     if (!encoder.needs_commit()) {
       auto guard = device.get_kernel("qwen35_ane_commit_guard", library);
@@ -3203,6 +3316,27 @@ public:
     }
     encoder.dispatch_threads(MTL::Size(output_dim, M, 1),
                              MTL::Size(16, 16, 1));
+    // The merge encoder reads this program's single output IOSurface. MLX
+    // commits this command buffer lazily, so without draining it here the
+    // next dispatch to the same program (the next 2K tile of one chunk on
+    // hosts with 4K prefill chunks) can begin its ANE evaluation and overwrite
+    // the surface before the merge kernel has executed. begin() only orders
+    // against the previous evaluation, not the previous merge. Commit and
+    // wait: the ANE and qmm branches were already joined on the host above,
+    // so the only added latency is the merge kernel itself.
+    {
+      encoder.end_encoding();
+      auto *merge_buffer = encoder.get_command_buffer();
+      merge_buffer->retain();
+      encoder.commit();
+      merge_buffer->waitUntilCompleted();
+      if (merge_buffer->status() == MTL::CommandBufferStatusError) {
+        merge_buffer->release();
+        throw std::runtime_error("ANE hybrid merge command buffer failed");
+      }
+      merge_buffer->release();
+    }
+
 
     if (!encoder.needs_commit()) {
       auto guard = device.get_kernel("qwen35_ane_commit_guard", library);
